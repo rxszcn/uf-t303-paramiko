@@ -244,6 +244,25 @@ class ConfigParseError(SSHException):
     pass
 
 
+class ConfigIncludeError(ConfigParseError):
+    """
+    An ``Include`` directive in an SSH config could not be expanded.
+
+    Raised when a literally named ``Include`` target does not exist, or when
+    ``Include`` directives form a cycle (possibly spanning several files). A
+    glob pattern which simply matches no files is *not* an error, matching
+    OpenSSH's behavior.
+
+    This subclasses `ConfigParseError` so that existing code catching the
+    latter keeps working, while still letting callers tell "the include chain
+    could not be expanded" apart from other parse failures.
+
+    .. versionadded:: 5.2
+    """
+
+    pass
+
+
 class MessageOrderError(SSHException):
     """
     Out-of-order protocol messages were received, violating "strict kex" mode.

@@ -18,6 +18,7 @@ from paramiko import (
     CouldNotCanonicalize,
     ConfigParseError,
 )
+from paramiko.ssh_exception import ConfigIncludeError
 
 from ._util import _config
 
@@ -1046,3 +1047,294 @@ class TestFinalMatching(object):
     def test_negated(self):
         result = load_config("match-final").lookup("jump")
         assert result["port"] == "1003"
+
+
+class TestInclude:
+    # Every test here writes its config tree underneath a "user config
+    # directory" so that relative include paths have something meaningful to
+    # resolve against (and to prove that resolution is *not* cwd-relative).
+
+    @fixture
+    def config_dir(self, tmp_path):
+        dir_ = tmp_path / "ssh"
+        dir_.mkdir()
+        return dir_
+
+    def _write(self, directory, name, text):
+        path = directory / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def _load(self, config_dir):
+        return SSHConfig.from_path(str(config_dir / "config"))
+
+    # -- Expansion semantics --------------------------------------------
+
+    def test_included_values_take_precedence_over_later_main_values(
+        self, config_dir
+    ):
+        self._write(
+            config_dir,
+            "cloud.conf",
+            """
+Host *
+    User cloudadmin
+    Port 2222
+""",
+        )
+        self._write(
+            config_dir,
+            "config",
+            """
+Include cloud.conf
+
+Host *
+    User mainuser
+    Port 22
+""",
+        )
+        result = self._load(config_dir).lookup("anywhere")
+        # The matrix's headline readout: included values win because they are
+        # expanded in place, before the main file's later global block.
+        assert result["user"] == "cloudadmin"
+        assert result["port"] == "2222"
+
+    def test_included_values_win_even_inside_same_host_block(
+        self, config_dir
+    ):
+        self._write(config_dir, "conf.d/user.conf", "User cloudadmin\n")
+        self._write(
+            config_dir,
+            "config",
+            """
+Host web
+    Include conf.d/user.conf
+    User webuser
+""",
+        )
+        assert self._load(config_dir).lookup("web")["user"] == "cloudadmin"
+
+    def test_include_inside_host_block_only_affects_that_block(
+        self, config_dir
+    ):
+        self._write(config_dir, "web.conf", "Port 2200\n")
+        self._write(
+            config_dir,
+            "config",
+            """
+Host web
+    Include web.conf
+
+Host db
+    Port 5432
+""",
+        )
+        config = self._load(config_dir)
+        # Splicing in place means the included key joins the current (Host
+        # web) block, not a fresh global one.
+        assert config.lookup("web")["port"] == "2200"
+        assert config.lookup("db")["port"] == "5432"
+
+    def test_host_and_match_blocks_inside_included_file(self, config_dir):
+        self._write(
+            config_dir,
+            "vendor.conf",
+            """
+Host cloud-*
+    User cloudadmin
+    Port 2022
+
+Match originalhost embedded-*
+    User embedbot
+""",
+        )
+        self._write(config_dir, "config", "Include vendor.conf\n")
+        config = self._load(config_dir)
+        assert config.lookup("cloud-node1")["user"] == "cloudadmin"
+        assert config.lookup("cloud-node1")["port"] == "2022"
+        assert config.lookup("other")["hostname"] == "other"
+        assert "port" not in config.lookup("other")
+        assert config.lookup("embedded-1")["user"] == "embedbot"
+
+    def test_match_user_inside_included_file(self, config_dir):
+        self._write(
+            config_dir,
+            "vendor.conf",
+            "Match user deploy\n    User deploybot\n",
+        )
+        self._write(config_dir, "config", "Include vendor.conf\n")
+        with patch("paramiko.config.getpass") as getpass:
+            getpass.getuser.return_value = "deploy"
+            assert self._load(config_dir).lookup("x")["user"] == "deploybot"
+
+    def test_identityfile_accumulates_in_expansion_order(self, config_dir):
+        self._write(
+            config_dir, "conf.d/base.conf", "IdentityFile base.key\n"
+        )
+        self._write(
+            config_dir, "conf.d/extra.conf", "IdentityFile extra.key\n"
+        )
+        self._write(
+            config_dir,
+            "config",
+            """
+Include conf.d/base.conf
+Include conf.d/extra.conf
+IdentityFile main.key
+""",
+        )
+        result = self._load(config_dir).lookup("anything")
+        assert result["identityfile"] == ["base.key", "extra.key", "main.key"]
+
+    def test_glob_expands_in_sorted_order(self, config_dir):
+        self._write(
+            config_dir, "conf.d/20-late.conf", "IdentityFile late.key\n"
+        )
+        self._write(
+            config_dir, "conf.d/10-early.conf", "IdentityFile e.key\n"
+        )
+        self._write(config_dir, "config", "Include conf.d/*.conf\n")
+        result = self._load(config_dir).lookup("anything")
+        assert result["identityfile"] == ["e.key", "late.key"]
+
+    def test_nested_includes_are_expanded(self, config_dir):
+        self._write(config_dir, "conf.d/inner.conf", "User inneruser\n")
+        self._write(
+            config_dir, "conf.d/outer.conf", "Include conf.d/inner.conf\n"
+        )
+        self._write(config_dir, "config", "Include conf.d/outer.conf\n")
+        assert self._load(config_dir).lookup("x")["user"] == "inneruser"
+
+    def test_nested_relative_path_is_not_relative_to_including_file(
+        self, config_dir
+    ):
+        # Matches OpenSSH: relative includes always resolve against the user
+        # config directory, never against the directory of the file that
+        # contains the Include line.
+        self._write(config_dir, "conf.d/inner.conf", "User inneruser\n")
+        self._write(config_dir, "conf.d/outer.conf", "Include inner.conf\n")
+        self._write(config_dir, "config", "Include conf.d/outer.conf\n")
+        with raises(ConfigIncludeError):
+            self._load(config_dir)
+
+    def test_multiple_paths_on_one_include_line(self, config_dir):
+        self._write(config_dir, "a.conf", "User auserv\n")
+        self._write(config_dir, "b.conf", "Port 2022\n")
+        self._write(config_dir, "config", "Include a.conf b.conf\n")
+        result = self._load(config_dir).lookup("x")
+        assert result["user"] == "auserv"
+        assert result["port"] == "2022"
+
+    def test_quoted_path_with_spaces(self, config_dir):
+        self._write(config_dir, "cloud keys", "User spaced\n")
+        self._write(config_dir, "config", 'Include "cloud keys"\n')
+        assert self._load(config_dir).lookup("x")["user"] == "spaced"
+
+    # -- Path bases -----------------------------------------------------
+
+    def test_relative_paths_resolve_against_config_dir_not_cwd(
+        self, config_dir, tmp_path, monkeypatch
+    ):
+        self._write(config_dir, "conf.d/cloud.conf", "User cloudadmin\n")
+        self._write(config_dir, "config", "Include conf.d/cloud.conf\n")
+        elsewhere = tmp_path / "unrelated"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        assert self._load(config_dir).lookup("x")["user"] == "cloudadmin"
+
+    def test_absolute_include_paths_are_used_as_is(self, config_dir, tmp_path):
+        target = tmp_path / "absolute.conf"
+        target.write_text("User absolute\n")
+        self._write(config_dir, "config", "Include {}\n".format(target))
+        assert self._load(config_dir).lookup("x")["user"] == "absolute"
+
+    def test_from_text_uses_given_path_as_relative_base(self, config_dir):
+        self._write(config_dir, "conf.d/cloud.conf", "User cloudadmin\n")
+        config = SSHConfig.from_text(
+            "Include conf.d/cloud.conf\n", path=str(config_dir / "config")
+        )
+        assert config.lookup("x")["user"] == "cloudadmin"
+
+    def test_from_text_without_path_bases_includes_on_ssh_dir(
+        self, tmp_path, monkeypatch
+    ):
+        # No path given -> fall back to OpenSSH's user config dir (~/.ssh).
+        home = tmp_path / "home"
+        ssh_dir = home / ".ssh"
+        ssh_dir.mkdir(parents=True)
+        (ssh_dir / "cloud.conf").write_text("User cloudadmin\n")
+
+        def fake_expanduser(value):
+            if value == "~" or value.startswith("~/"):
+                return str(home) + value[1:]
+            return value
+
+        monkeypatch.setattr(
+            "paramiko.config.os.path.expanduser", fake_expanduser
+        )
+        config = SSHConfig.from_text("Include ~/.ssh/cloud.conf\n")
+        assert config.lookup("x")["user"] == "cloudadmin"
+
+    # -- Error inputs ---------------------------------------------------
+
+    def test_glob_matching_nothing_is_not_an_error(self, config_dir):
+        self._write(config_dir, "config", """
+Include conf.d/*.conf
+
+Host *
+    User mainuser
+""")
+        config = self._load(config_dir)
+        assert config.lookup("x")["user"] == "mainuser"
+
+    def test_explicitly_named_missing_file_raises(self, config_dir):
+        self._write(config_dir, "config", "Include missing.conf\n")
+        with raises(ConfigIncludeError) as info:
+            self._load(config_dir)
+        assert "missing.conf" in str(info.value)
+
+    def test_missing_file_raises_even_when_other_entries_match(
+        self, config_dir
+    ):
+        self._write(config_dir, "a.conf", "User auserv\n")
+        self._write(config_dir, "config", "Include a.conf nope.conf\n")
+        with raises(ConfigIncludeError):
+            self._load(config_dir)
+
+    def test_mutual_include_cycle_raises(self, config_dir):
+        self._write(config_dir, "a.conf", "Include b.conf\n")
+        self._write(config_dir, "b.conf", "Include a.conf\n")
+        self._write(config_dir, "config", "Include a.conf\n")
+        with raises(ConfigIncludeError) as info:
+            self._load(config_dir)
+        assert "cycle" in str(info.value).lower()
+
+    def test_self_include_cycle_raises(self, config_dir):
+        self._write(config_dir, "config", "Include config\n")
+        with raises(ConfigIncludeError):
+            self._load(config_dir)
+
+    def test_include_error_is_a_config_parse_error(self, config_dir):
+        self._write(config_dir, "config", "Include missing.conf\n")
+        with raises(ConfigParseError):
+            self._load(config_dir)
+        # ...but a distinguishable one for callers who care.
+        with raises(ConfigIncludeError):
+            self._load(config_dir)
+
+    # -- Unchanged behavior ---------------------------------------------
+
+    def test_config_without_include_parses_identically(self, config_dir):
+        text = """
+Host *.example.com
+    Port 2222
+
+Host *
+    Port 3333
+"""
+        self._write(config_dir, "config", text)
+        # Passing a path must not perturb parsing of include-free configs.
+        loaded = self._load(config_dir)
+        assert loaded._config == SSHConfig.from_text(text)._config
+        assert loaded.lookup("foo.example.com")["port"] == "2222"

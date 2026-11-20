@@ -23,6 +23,7 @@ Configuration file (aka ``ssh_config``) support.
 
 import fnmatch
 import getpass
+import glob
 import os
 import re
 import shlex
@@ -37,7 +38,11 @@ try:
 except ImportError as e:
     invoke_import_error = e
 
-from .ssh_exception import ConfigParseError, CouldNotCanonicalize
+from .ssh_exception import (
+    ConfigIncludeError,
+    ConfigParseError,
+    CouldNotCanonicalize,
+)
 
 SSH_PORT = 22
 
@@ -90,13 +95,20 @@ class SSHConfig:
         self._config = []
 
     @classmethod
-    def from_text(cls, text):
+    def from_text(cls, text, path=None):
         """
         Create a new, parsed `SSHConfig` from ``text`` string.
 
+        :param str path:
+            Optional path to treat as the file this text came from. Only its
+            directory is used, as the base for relative ``Include`` paths (see
+            `parse`).
+
         .. versionadded:: 2.7
+        .. versionchanged:: 5.2
+            Added the ``path`` argument.
         """
-        return cls.from_file(StringIO(text))
+        return cls.from_file(StringIO(text), path=path)
 
     @classmethod
     def from_path(cls, path):
@@ -106,43 +118,68 @@ class SSHConfig:
         .. versionadded:: 2.7
         """
         with open(path) as flo:
-            return cls.from_file(flo)
+            return cls.from_file(flo, path=path)
 
     @classmethod
-    def from_file(cls, flo):
+    def from_file(cls, flo, path=None):
         """
         Create a new, parsed `SSHConfig` from file-like object ``flo``.
 
+        :param str path:
+            Optional path to treat as the file ``flo`` came from. Only its
+            directory is used, as the base for relative ``Include`` paths (see
+            `parse`).
+
         .. versionadded:: 2.7
+        .. versionchanged:: 5.2
+            Added the ``path`` argument.
         """
         obj = cls()
-        obj.parse(flo)
+        obj.parse(flo, path=path)
         return obj
 
-    def parse(self, file_obj):
+    def parse(self, file_obj, path=None):
         """
         Read an OpenSSH config from the given file object.
 
+        ``Include`` directives are expanded in place: the referenced files are
+        read at the point where the directive appears, so their contents join
+        the currently open ``Host``/``Match`` block, and ordinary "first value
+        wins" semantics apply to the resulting sequence (an included value
+        therefore takes precedence over a same-named value given later in the
+        including file). Wildcards are supported and each matching file is
+        included in sorted order. Files which themselves contain ``Include``
+        directives are expanded recursively.
+
+        Relative include paths are resolved against a fixed base directory,
+        never against the process' current working directory:
+
+        * if ``path`` is given, the directory containing it (thus an
+          ``~/.ssh/config`` file gets ``~/.ssh``, matching OpenSSH's behavior
+          for user configs);
+        * otherwise, ``~/.ssh`` (OpenSSH's default location for user configs).
+
+        A path naming a file that does not exist raises `ConfigIncludeError`;
+        a wildcard pattern matching no files is not an error (also matching
+        OpenSSH). An include cycle likewise raises `ConfigIncludeError`.
+
         :param file_obj: a file-like object to read the config file from
+        :param str path: optional path of the file ``file_obj`` represents,
+            used only to determine the base directory for relative includes
+
+        .. versionchanged:: 5.2
+            Added ``Include`` support and the ``path`` argument.
         """
+        base_dir = self._include_base_dir(path)
+        # Real paths of the files currently being parsed, outermost first; used
+        # to detect include cycles. (Not a general 'already seen' set: a file
+        # included twice in sequence is fine and gets parsed twice, exactly as
+        # if its text had been spliced in twice.)
+        chain = (os.path.realpath(path),) if path is not None else ()
         # Start out w/ implicit/anonymous global host-like block to hold
         # anything not contained by an explicit one.
         context = {"host": ["*"], "config": {}}
-        for line in file_obj:
-            # Strip any leading or trailing whitespace from the line.
-            # Refer to https://github.com/paramiko/paramiko/issues/499
-            line = line.strip()
-            # Skip blanks, comments
-            if not line or line.startswith("#"):
-                continue
-
-            # Parse line into key, value
-            match = re.match(self.SETTINGS_REGEX, line)
-            if not match:
-                raise ConfigParseError("Unparsable line {}".format(line))
-            key = match.group(1).lower()
-            value = match.group(2)
-
+        for key, value in self._iter_lines(file_obj, base_dir, chain):
             # Host keyword triggers switch to new block/context
             if key in ("host", "match"):
                 self._config.append(context)
@@ -178,6 +215,93 @@ class SSHConfig:
                     context["config"][key] = value
         # Store last 'open' block and we're done
         self._config.append(context)
+
+    def _iter_lines(self, file_obj, base_dir, chain):
+        """
+        Yield ``(key, value)`` pairs from ``file_obj``, expanding ``Include``
+        directives in place (i.e. as if their files' text were spliced in).
+
+        ``key`` is lowercased; ``value`` is the raw remainder of the line with
+        surrounding double quotes still intact (the `parse` caller applies the
+        usual quote stripping).
+        """
+        for line in file_obj:
+            # Strip any leading or trailing whitespace from the line.
+            # Refer to https://github.com/paramiko/paramiko/issues/499
+            line = line.strip()
+            # Skip blanks, comments
+            if not line or line.startswith("#"):
+                continue
+
+            # Parse line into key, value
+            match = re.match(self.SETTINGS_REGEX, line)
+            if not match:
+                raise ConfigParseError("Unparsable line {}".format(line))
+            key = match.group(1).lower()
+            value = match.group(2)
+
+            if key == "include":
+                for path in self._resolve_includes(value, base_dir):
+                    real = os.path.realpath(path)
+                    if real in chain:
+                        raise ConfigIncludeError(
+                            "Include cycle detected: {} (via {})".format(
+                                path, " -> ".join(chain + (real,))
+                            )
+                        )
+                    try:
+                        with open(path) as flo:
+                            yield from self._iter_lines(
+                                flo, base_dir, chain + (real,)
+                            )
+                    except OSError as e:
+                        raise ConfigIncludeError(
+                            "Could not read included config file "
+                            "{}: {}".format(path, e)
+                        )
+                continue
+            yield key, value
+
+    def _include_base_dir(self, path):
+        if path is not None:
+            return os.path.dirname(os.path.abspath(os.path.expanduser(path)))
+        return os.path.expanduser("~/.ssh")
+
+    def _resolve_includes(self, value, base_dir):
+        """
+        Turn the value of one ``Include`` directive into a list of file paths
+        to read, in order.
+
+        Wildcard patterns are expanded (sorted, and silently allowed to match
+        nothing); a pattern naming a single file which does not exist raises
+        `ConfigIncludeError`.
+        """
+        try:
+            patterns = shlex.split(value, posix=False)
+        except ValueError:
+            raise ConfigParseError(
+                "Unparsable include path {}".format(value)
+            )
+        # shlex leaves quotes attached in non-posix mode
+        patterns = [
+            p[1:-1] if len(p) > 1 and p[0] == p[-1] and p[0] in "\"'" else p
+            for p in patterns
+        ]
+        paths = []
+        for pattern in patterns:
+            target = os.path.expanduser(pattern)
+            if not os.path.isabs(target):
+                target = os.path.join(base_dir, target)
+            target = os.path.normpath(target)
+            if glob.has_magic(target):
+                paths.extend(sorted(glob.glob(target)))
+            elif os.path.isfile(target):
+                paths.append(target)
+            else:
+                raise ConfigIncludeError(
+                    "Included config file not found: {}".format(target)
+                )
+        return paths
 
     def lookup(self, hostname):
         """
